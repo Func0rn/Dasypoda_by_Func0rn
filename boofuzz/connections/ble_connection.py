@@ -9,16 +9,23 @@
 
 import time
 import struct
+import json
+import requests
 from enum import Enum, auto
 from threading import Thread, Event
 from typing import Optional, Callable, Dict, Any
-from binascii import hexlify
+from binascii import hexlify, unhexlify
 
 from boofuzz.connections import itarget_connection
 from boofuzz.exception import BoofuzzTargetConnectionFailedError
 
-# Sweyntooth 协议栈导入
-from ..utils.sweyntooth.drivers.NRF52_dongle import NRF52Dongle
+# Sweyntooth 协议栈导入 (仅用于 Scapy 层定义)
+try:
+    from ..utils.sweyntooth.drivers.NRF52_dongle import NRF52Dongle
+    HAS_LOCAL_DRIVER = True
+except ImportError:
+    HAS_LOCAL_DRIVER = False
+
 from ..utils.sweyntooth.libs.scapy.layers.bluetooth4LE import (
     BTLE, BTLE_ADV, BTLE_DATA, BTLE_SCAN_REQ, BTLE_SCAN_RSP,
     BTLE_ADV_IND, BTLE_CONNECT_REQ, BTLE_EMPTY_PDU, CtrlPDU,
@@ -201,8 +208,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
         self._logs_pcap = logs_pcap
         self._pcap_filename = pcap_filename or f'ble_fuzz_{target_address.replace(":", "")}.pcap'
         
-        # 硬件驱动
+        # 硬件驱动 (本地或远程桥接)
         self._driver: Optional[NRF52Dongle] = None
+        self._bridge_url = "http://127.0.0.1:5000"
+        self._use_bridge = not HAS_LOCAL_DRIVER
         
         # 连接状态
         self._state = BLEConnectionState.IDLE
@@ -251,12 +260,20 @@ class BLEConnection(itarget_connection.ITargetConnection):
         """打开连接并建立 BLE 链路"""
         try:
             # 初始化硬件驱动
-            self._driver = NRF52Dongle(
-                self._port, 
-                str(115200),
-                logs_pcap=self._logs_pcap,
-                pcap_filename=self._pcap_filename
-            )
+            if self._use_bridge:
+                resp = requests.post(f"{self._bridge_url}/init", json={
+                    "port": self._port,
+                    "baudrate": "115200"
+                })
+                if resp.status_code != 200:
+                    raise BoofuzzTargetConnectionFailedError(f"无法初始化桥接服务: {resp.text}")
+            else:
+                self._driver = NRF52Dongle(
+                    self._port,
+                    str(115200),
+                    logs_pcap=self._logs_pcap,
+                    pcap_filename=self._pcap_filename
+                )
             
             # 启动后台接收线程
             self._stop_event.clear()
@@ -276,8 +293,8 @@ class BLEConnection(itarget_connection.ITargetConnection):
     def close(self):
         """关闭连接"""
         # 发送断开请求
-        if self._driver and self._state in (
-            BLEConnectionState.CONNECTED, 
+        if (self._driver or self._use_bridge) and self._state in (
+            BLEConnectionState.CONNECTED,
             BLEConnectionState.READY,
             BLEConnectionState.ENCRYPTED
         ):
@@ -299,7 +316,12 @@ class BLEConnection(itarget_connection.ITargetConnection):
                 pass
         
         # 关闭驱动
-        if self._driver:
+        if self._use_bridge:
+            try:
+                requests.post(f"{self._bridge_url}/close")
+            except:
+                pass
+        elif self._driver:
             self._driver.close()
             self._driver = None
         
@@ -324,7 +346,13 @@ class BLEConnection(itarget_connection.ITargetConnection):
             if self._encryption_enabled:
                 self.send_encrypted(pkt)
             else:
-                self._driver.send(pkt)
+                if self._use_bridge:
+                    raw_data = raw(pkt)
+                    requests.post(f"{self._bridge_url}/send", json={
+                        "data": hexlify(raw_data).decode('ascii')
+                    })
+                else:
+                    self._driver.send(pkt)
             
             return len(data)
             
@@ -333,7 +361,7 @@ class BLEConnection(itarget_connection.ITargetConnection):
     
     def recv(self, max_bytes: int) -> bytes:
         """接收响应数据"""
-        if not self._driver:
+        if not self._driver and not self._use_bridge:
             return b""
         
         start_time = time.time()
@@ -373,7 +401,12 @@ class BLEConnection(itarget_connection.ITargetConnection):
             ScanA=self._master_address,
             AdvA=self._target_address
         )
-        self._driver.send(scan_req)
+        if self._use_bridge:
+            requests.post(f"{self._bridge_url}/send", json={
+                "data": hexlify(raw(scan_req)).decode('ascii')
+            })
+        else:
+            self._driver.send(scan_req)
         
         # 等待连接建立
         start_time = time.time()
@@ -401,7 +434,16 @@ class BLEConnection(itarget_connection.ITargetConnection):
         """后台接收线程 - 处理所有 BLE 包"""
         while not self._stop_event.is_set():
             try:
-                data = self._driver.raw_receive()
+                if self._use_bridge:
+                    resp = requests.get(f"{self._bridge_url}/recv", params={"timeout": 0.1})
+                    data = None
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        if res_json.get("status") == "success":
+                            data = unhexlify(res_json["data"])
+                else:
+                    data = self._driver.raw_receive()
+
                 if data:
                     self._last_rx_time = time.time()
                     self._process_packet(data)
