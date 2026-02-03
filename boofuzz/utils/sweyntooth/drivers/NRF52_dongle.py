@@ -5,7 +5,7 @@ import sys
 import serial
 import serial.tools.list_ports
 
-sys.path.insert(0, os.getcwd() + '../libs')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'libs'))
 from colorama import Fore
 from scapy.utils import raw, wrpcap
 from scapy.layers.bluetooth4LE import BTLE, NORDIC_BLE

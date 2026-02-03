@@ -5,7 +5,7 @@ import sys
 from time import sleep
 
 # libs
-sys.path.insert(0, os.getcwd() + '/libs')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'libs'))
 import colorama
 from colorama import Fore
 from drivers.NRF52_dongle import NRF52Dongle

@@ -1,0 +1,12 @@
+{
+    "manifest": {
+        "application": {
+            "bin_file": "firmware.bin",
+            "dat_file": "firmware.dat"
+        },
+        "softdevice": {
+            "bin_file": "s140_nrf52_6.1.1_softdevice.bin",
+            "dat_file": "s140_nrf52_6.1.1_softdevice.dat"
+        }
+    }
+}

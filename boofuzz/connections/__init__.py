@@ -13,9 +13,24 @@ from .ssl_socket_connection import SSLSocketConnection
 from .tcp_socket_connection import TCPSocketConnection
 from .udp_socket_connection import UDPSocketConnection
 from .unix_socket_connection import UnixSocketConnection
+# BLE Connection (基于 Sweyntooth)
+from .ble_connection import (
+    BLEConnection, 
+    BLEFuzzLayer, 
+    BLEConnectionState,
+    SMPConfig,
+    BLEIOCapability,
+    BLEAuthReq
+)
 
 __all__ = [
     "BaseSocketConnection",
+    "BLEConnection",
+    "BLEConnectionState",
+    "BLEFuzzLayer",
+    "BLEIOCapability",
+    "BLEAuthReq",
+    "SMPConfig",
     "FileConnection",
     "ISerialLike",
     "ITargetConnection",
