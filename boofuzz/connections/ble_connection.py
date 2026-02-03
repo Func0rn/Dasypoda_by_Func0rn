@@ -10,7 +10,7 @@
 import time
 import struct
 import json
-import requests
+import socket
 from enum import Enum, auto
 from threading import Thread, Event
 from typing import Optional, Callable, Dict, Any
@@ -19,28 +19,34 @@ from binascii import hexlify, unhexlify
 from boofuzz.connections import itarget_connection
 from boofuzz.exception import BoofuzzTargetConnectionFailedError
 
-# Sweyntooth 协议栈导入 (仅用于 Scapy 层定义)
+# Sweyntooth 协议栈导入 (仅用于本地驱动模式)
 try:
     from ..utils.sweyntooth.drivers.NRF52_dongle import NRF52Dongle
+    from ..utils.sweyntooth.libs.scapy.layers.bluetooth4LE import (
+        BTLE, BTLE_ADV, BTLE_DATA, BTLE_SCAN_REQ, BTLE_SCAN_RSP,
+        BTLE_ADV_IND, BTLE_CONNECT_REQ, BTLE_EMPTY_PDU, CtrlPDU,
+        LL_VERSION_IND, LL_FEATURE_REQ, LL_FEATURE_RSP,
+        LL_LENGTH_REQ, LL_LENGTH_RSP, LL_UNKNOWN_RSP,
+        LL_ENC_REQ, LL_ENC_RSP, LL_START_ENC_REQ, LL_START_ENC_RSP,
+        LL_TERMINATE_IND, LL_REJECT_IND
+    )
+    from ..utils.sweyntooth.libs.scapy.layers.bluetooth import (
+        L2CAP_Hdr, ATT_Hdr, SM_Hdr, HCI_Hdr, HCI_ACL_Hdr,
+        ATT_Exchange_MTU_Request, ATT_Exchange_MTU_Response,
+        SM_Pairing_Request, SM_Pairing_Response, SM_Failed,
+        SM_Random, SM_Security_Request, SM_Public_Key, SM_Confirm
+    )
+    from ..utils.sweyntooth.libs.scapy.utils import raw
     HAS_LOCAL_DRIVER = True
 except ImportError:
     HAS_LOCAL_DRIVER = False
-
-from ..utils.sweyntooth.libs.scapy.layers.bluetooth4LE import (
-    BTLE, BTLE_ADV, BTLE_DATA, BTLE_SCAN_REQ, BTLE_SCAN_RSP,
-    BTLE_ADV_IND, BTLE_CONNECT_REQ, BTLE_EMPTY_PDU, CtrlPDU,
-    LL_VERSION_IND, LL_FEATURE_REQ, LL_FEATURE_RSP,
-    LL_LENGTH_REQ, LL_LENGTH_RSP, LL_UNKNOWN_RSP,
-    LL_ENC_REQ, LL_ENC_RSP, LL_START_ENC_REQ, LL_START_ENC_RSP,
-    LL_TERMINATE_IND, LL_REJECT_IND
-)
-from ..utils.sweyntooth.libs.scapy.layers.bluetooth import (
-    L2CAP_Hdr, ATT_Hdr, SM_Hdr, HCI_Hdr, HCI_ACL_Hdr,
-    ATT_Exchange_MTU_Request, ATT_Exchange_MTU_Response,
-    SM_Pairing_Request, SM_Pairing_Response, SM_Failed,
-    SM_Random, SM_Security_Request, SM_Public_Key, SM_Confirm
-)
-from ..utils.sweyntooth.libs.scapy.utils import raw
+    # 如果本地导入失败，定义 Dummy 类或使用字符串标识符，因为在桥接模式下不需要本地 Scapy 对象
+    BTLE = BTLE_DATA = BTLE_SCAN_RSP = BTLE_ADV_IND = None
+    LL_VERSION_IND = LL_FEATURE_RSP = LL_FEATURE_REQ = LL_LENGTH_REQ = LL_LENGTH_RSP = LL_UNKNOWN_RSP = None
+    LL_TERMINATE_IND = LL_REJECT_IND = LL_ENC_RSP = LL_START_ENC_RSP = None
+    ATT_Exchange_MTU_Response = SM_Hdr = SM_Security_Request = SM_Pairing_Response = None
+    SM_Public_Key = SM_Confirm = SM_Random = SM_Failed = L2CAP_Hdr = ATT_Hdr = None
+    def raw(x): return x
 
 # BLESMPServer - 配对/加密状态机 (可选)
 try:
@@ -210,7 +216,8 @@ class BLEConnection(itarget_connection.ITargetConnection):
         
         # 硬件驱动 (本地或远程桥接)
         self._driver: Optional[NRF52Dongle] = None
-        self._bridge_url = "http://127.0.0.1:5000"
+        self._bridge_host = "127.0.0.1"
+        self._bridge_port = 5000
         self._use_bridge = not HAS_LOCAL_DRIVER
         
         # 连接状态
@@ -254,6 +261,21 @@ class BLEConnection(itarget_connection.ITargetConnection):
         # SMP 服务器初始化标志
         self._smp_initialized = False
     
+    def _call_bridge(self, cmd, params=None):
+        """调用 Socket 桥接服务"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect((self._bridge_host, self._bridge_port))
+                request = {"cmd": cmd, "params": params or {}}
+                s.sendall(json.dumps(request).encode('utf-8'))
+                data = s.recv(4096)
+                if not data:
+                    return {"status": "error", "message": "No response from bridge"}
+                return json.loads(data.decode('utf-8'))
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     # ==================== ITargetConnection 接口实现 ====================
     
     def open(self):
@@ -261,12 +283,12 @@ class BLEConnection(itarget_connection.ITargetConnection):
         try:
             # 初始化硬件驱动
             if self._use_bridge:
-                resp = requests.post(f"{self._bridge_url}/init", json={
+                resp = self._call_bridge("init", {
                     "port": self._port,
                     "baudrate": "115200"
                 })
-                if resp.status_code != 200:
-                    raise BoofuzzTargetConnectionFailedError(f"无法初始化桥接服务: {resp.text}")
+                if resp.get("status") != "success":
+                    raise BoofuzzTargetConnectionFailedError(f"无法初始化桥接服务: {resp.get('message')}")
             else:
                 self._driver = NRF52Dongle(
                     self._port,
@@ -318,7 +340,7 @@ class BLEConnection(itarget_connection.ITargetConnection):
         # 关闭驱动
         if self._use_bridge:
             try:
-                requests.post(f"{self._bridge_url}/close")
+                self._call_bridge("close")
             except:
                 pass
         elif self._driver:
@@ -341,16 +363,17 @@ class BLEConnection(itarget_connection.ITargetConnection):
                 raise BoofuzzTargetConnectionFailedError("连接未就绪")
         
         try:
-            pkt = self._wrap_fuzz_data(data)
-            
-            if self._encryption_enabled:
-                self.send_encrypted(pkt)
+            if self._use_bridge:
+                self._call_bridge("construct_and_send", {
+                    "layer": "WRAP_FUZZ",
+                    "fuzz_layer": self._fuzz_layer.name,
+                    "payload": hexlify(data).decode('ascii'),
+                    "access_address": self._access_address
+                })
             else:
-                if self._use_bridge:
-                    raw_data = raw(pkt)
-                    requests.post(f"{self._bridge_url}/send", json={
-                        "data": hexlify(raw_data).decode('ascii')
-                    })
+                pkt = self._wrap_fuzz_data(data)
+                if self._encryption_enabled:
+                    self.send_encrypted(pkt)
                 else:
                     self._driver.send(pkt)
             
@@ -397,15 +420,18 @@ class BLEConnection(itarget_connection.ITargetConnection):
         self._reset_protocol_state()
         
         # 发送扫描请求
-        scan_req = BTLE() / BTLE_ADV(RxAdd=self._slave_addr_type) / BTLE_SCAN_REQ(
-            ScanA=self._master_address,
-            AdvA=self._target_address
-        )
         if self._use_bridge:
-            requests.post(f"{self._bridge_url}/send", json={
-                "data": hexlify(raw(scan_req)).decode('ascii')
+            self._call_bridge("construct_and_send", {
+                "layer": "SCAN_REQ",
+                "master_address": self._master_address,
+                "target_address": self._target_address,
+                "slave_addr_type": self._slave_addr_type
             })
         else:
+            scan_req = BTLE() / BTLE_ADV(RxAdd=self._slave_addr_type) / BTLE_SCAN_REQ(
+                ScanA=self._master_address,
+                AdvA=self._target_address
+            )
             self._driver.send(scan_req)
         
         # 等待连接建立
@@ -435,12 +461,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
         while not self._stop_event.is_set():
             try:
                 if self._use_bridge:
-                    resp = requests.get(f"{self._bridge_url}/recv", params={"timeout": 0.1})
+                    res_json = self._call_bridge("recv", {"timeout": 0.1})
                     data = None
-                    if resp.status_code == 200:
-                        res_json = resp.json()
-                        if res_json.get("status") == "success":
-                            data = unhexlify(res_json["data"])
+                    if res_json.get("status") == "success":
+                        data = unhexlify(res_json["data"])
                 else:
                     data = self._driver.raw_receive()
 
@@ -459,7 +483,17 @@ class BLEConnection(itarget_connection.ITargetConnection):
         参考 Sweyntooth 的事件驱动处理模式
         """
         try:
-            pkt = BTLE(data)
+            if self._use_bridge:
+                # 在桥接模式下，我们需要一种方式来判断包类型，而无需本地 Scapy
+                # 为简化，我们可以将数据包解析也交给桥接服务，或者在这里进行简单的字节匹配
+                # 这里我们假设桥接模式下仍然使用本地 Scapy 层的定义（如果可能），
+                # 或者我们需要进一步扩展桥接服务来返回解析后的包信息。
+                # 目前由于 Scapy 层定义是 Python 2.7 的，Python 3 可能无法直接使用。
+                # 暂时保留此处的解析逻辑，但需注意兼容性。
+                from ..utils.sweyntooth.libs.scapy.layers.bluetooth4LE import BTLE
+                pkt = BTLE(data)
+            else:
+                pkt = BTLE(data)
         except:
             return
         
@@ -612,64 +646,85 @@ class BLEConnection(itarget_connection.ITargetConnection):
     
     def _send_connection_request(self):
         """发送 CONNECT_REQ"""
-        conn_req = BTLE() / BTLE_ADV(RxAdd=self._slave_addr_type, TxAdd=0) / BTLE_CONNECT_REQ(
-            InitA=self._master_address,
-            AdvA=self._target_address,
-            AA=self._access_address,
-            crc_init=0x179a9c,
-            win_size=2,
-            win_offset=1,
-            interval=16,      # 20ms
-            latency=0,
-            timeout=50,       # 500ms
-            chM=0x1FFFFFFFFF,
-            hop=5,
-            SCA=0
-        )
-        self._driver.send(conn_req)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {
+                "layer": "CONN_REQ",
+                "master_address": self._master_address,
+                "target_address": self._target_address,
+                "slave_addr_type": self._slave_addr_type,
+                "access_address": self._access_address
+            })
+        else:
+            conn_req = BTLE() / BTLE_ADV(RxAdd=self._slave_addr_type, TxAdd=0) / BTLE_CONNECT_REQ(
+                InitA=self._master_address, AdvA=self._target_address, AA=self._access_address,
+                crc_init=0x179a9c, win_size=2, win_offset=1, interval=16,
+                latency=0, timeout=50, chM=0x1FFFFFFFFF, hop=5, SCA=0
+            )
+            self._driver.send(conn_req)
     
     def _send_version_ind(self):
         """发送 LL_VERSION_IND"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_VERSION_IND(version='4.2')
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "LL_VERSION_IND", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_VERSION_IND(version='4.2')
+            self._driver.send(pkt)
     
     def _send_feature_req(self):
         """发送 LL_FEATURE_REQ"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_FEATURE_REQ(
-            feature_set='le_encryption+le_data_len_ext'
-        )
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "LL_FEATURE_REQ", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_FEATURE_REQ(
+                feature_set='le_encryption+le_data_len_ext'
+            )
+            self._driver.send(pkt)
     
     def _send_feature_rsp(self):
         """发送 LL_FEATURE_RSP"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_FEATURE_RSP(
-            feature_set='le_encryption+le_data_len_ext'
-        )
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "LL_FEATURE_RSP", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_FEATURE_RSP(
+                feature_set='le_encryption+le_data_len_ext'
+            )
+            self._driver.send(pkt)
     
     def _send_length_req(self):
         """发送 LL_LENGTH_REQ"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_LENGTH_REQ(
-            max_tx_bytes=251, max_rx_bytes=251
-        )
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "LL_LENGTH_REQ", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_LENGTH_REQ(
+                max_tx_bytes=251, max_rx_bytes=251
+            )
+            self._driver.send(pkt)
     
     def _send_length_rsp(self):
         """发送 LL_LENGTH_RSP"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_LENGTH_RSP(
-            max_tx_bytes=251, max_rx_bytes=251
-        )
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "LL_LENGTH_RSP", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_LENGTH_RSP(
+                max_tx_bytes=251, max_rx_bytes=251
+            )
+            self._driver.send(pkt)
     
     def _send_mtu_request(self):
         """发送 ATT MTU 交换请求"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / L2CAP_Hdr() / ATT_Hdr() / ATT_Exchange_MTU_Request(mtu=247)
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "ATT_MTU_REQ", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / L2CAP_Hdr() / ATT_Hdr() / ATT_Exchange_MTU_Request(mtu=247)
+            self._driver.send(pkt)
     
     def _send_terminate(self):
         """发送断开连接请求"""
-        pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_TERMINATE_IND()
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("construct_and_send", {"layer": "TERMINATE", "access_address": self._access_address})
+        else:
+            pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_TERMINATE_IND()
+            self._driver.send(pkt)
     
     # ==================== Fuzz 数据包装 ====================
     
@@ -758,7 +813,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
         
         if not self._encryption_enabled or not self._conn_session_key:
             # 未加密，直接发送
-            self._driver.send(pkt)
+            if self._use_bridge:
+                self._call_bridge("send", {"data": hexlify(raw(pkt)).decode('ascii')})
+            else:
+                self._driver.send(pkt)
             return
         
         raw_pkt = bytearray(raw(pkt))
@@ -784,7 +842,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
         
         # 组装加密包
         encrypted_data = bytes(aa) + bytes([header]) + bytes([length]) + enc_pkt + mic + crc
-        self._driver.raw_send(encrypted_data)
+        if self._use_bridge:
+            self._call_bridge("send", {"data": hexlify(encrypted_data).decode('ascii')})
+        else:
+            self._driver.raw_send(encrypted_data)
         print(f"[BLE] TX ---> [Encrypted] {pkt.summary()[7:] if hasattr(pkt, 'summary') else hexlify(bytes(raw_pkt[6:-3])).decode()}")
     
     def _receive_encrypted(self, pkt) -> Optional[BTLE]:
@@ -886,7 +947,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
         # 发送 Pairing Request
         pairing_req_data = BLESMPServer.pairing_request()
         pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / L2CAP_Hdr() / HCI_Hdr(pairing_req_data)
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("send", {"data": hexlify(raw(pkt)).decode('ascii')})
+        else:
+            self._driver.send(pkt)
         print("[BLE] 发送 Pairing Request")
         
         return True
@@ -918,7 +982,10 @@ class BLEConnection(itarget_connection.ITargetConnection):
                 # 提取 L2CAP payload
                 l2cap_data = raw(resp_pkt[L2CAP_Hdr:])
                 ble_pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / L2CAP_Hdr() / l2cap_data
-                self._driver.send(ble_pkt)
+                if self._use_bridge:
+                    self._call_bridge("send", {"data": hexlify(raw(ble_pkt)).decode('ascii')})
+                else:
+                    self._driver.send(ble_pkt)
                 print(f"[BLE] SMP 响应已发送")
         
         # 检查配对状态
@@ -980,13 +1047,19 @@ class BLEConnection(itarget_connection.ITargetConnection):
         pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_ENC_REQ(
             rand=rand, ediv=ediv, skdm=skdm, ivm=ivm
         )
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("send", {"data": hexlify(raw(pkt)).decode('ascii')})
+        else:
+            self._driver.send(pkt)
         print("[BLE] 发送 LL_ENC_REQ")
     
     def _send_start_enc_req(self):
         """发送 LL_START_ENC_REQ"""
         pkt = BTLE(access_addr=self._access_address) / BTLE_DATA() / CtrlPDU() / LL_START_ENC_REQ()
-        self._driver.send(pkt)
+        if self._use_bridge:
+            self._call_bridge("send", {"data": hexlify(raw(pkt)).decode('ascii')})
+        else:
+            self._driver.send(pkt)
         print("[BLE] 发送 LL_START_ENC_REQ")
     
     # ==================== 公共接口 ====================
