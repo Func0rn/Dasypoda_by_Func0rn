@@ -16,16 +16,17 @@ BLE Fuzzing 示例 - 基于 Boofuzz + Sweyntooth
 1. NRF52 Dongle 已连接并刷入 Sweyntooth 固件
 2. 目标 BLE 设备处于可连接广告状态
 3. 修改 TARGET_ADDRESS 为目标设备的 MAC 地址
+4. **启动 Socket 桥接服务** (Python 2.7): `python boofuzz/utils/sweyntooth/socket_bridge.py`
 
-加密功能需要:
+加密功能需要 (在 Python 2.7 桥接端):
 - 安装 BLESMPServer: cd boofuzz/utils/sweyntooth/libs/smp_server && python setup.py install
 - 安装 PyCryptodome: pip install pycryptodome
 """
 
 from boofuzz import *
-from boofuzz.connections import (
-    BLEConnection, 
-    BLEFuzzLayer, 
+from boofuzz.connections.ble_connection import (
+    BLEConnection,
+    BLEFuzzLayer,
     BLEConnectionState,
     SMPConfig,
     BLEIOCapability,
@@ -58,8 +59,8 @@ def fuzz_att_layer():
         target_address=TARGET_ADDRESS,
         fuzz_layer=BLEFuzzLayer.ATT,  # 指定 Fuzz ATT 层
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/att_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     target = Target(connection=connection)
@@ -128,8 +129,8 @@ def fuzz_link_layer():
         target_address=TARGET_ADDRESS,
         fuzz_layer=BLEFuzzLayer.LINK_LAYER,
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/ll_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     target = Target(connection=connection)
@@ -189,8 +190,8 @@ def fuzz_smp_layer():
         target_address=TARGET_ADDRESS,
         fuzz_layer=BLEFuzzLayer.SMP,
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/smp_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     target = Target(connection=connection)
@@ -254,8 +255,8 @@ def fuzz_l2cap_layer():
         target_address=TARGET_ADDRESS,
         fuzz_layer=BLEFuzzLayer.L2CAP,
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/l2cap_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     target = Target(connection=connection)
@@ -363,8 +364,8 @@ def fuzz_encrypted_connection():
         enable_encryption=True,     # 启用加密
         smp_config=smp_config,      # SMP 配置
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/encrypted_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     # 设置配对完成回调
@@ -439,8 +440,8 @@ def fuzz_pairing_manually():
         fuzz_layer=BLEFuzzLayer.SMP,
         enable_encryption=False,  # 我们手动控制配对
         auto_reconnect=True,
-        logs_pcap=True,
-        pcap_filename='logs/pairing_fuzz.pcap'
+        bridge_host='127.0.0.1',
+        bridge_port=5000
     )
     
     target = Target(connection=connection)
